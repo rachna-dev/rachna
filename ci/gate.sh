@@ -126,8 +126,44 @@ mutants() {
     fi
   done
 
+  # SCOPE: the diff by default, the whole crate when asked.
+  #
+  # Measured, which is what forced the split: 0.26 min/mutant, so the
+  # crate's 1204 mutants are ~5.3 h on a 10-core machine and ~13 h on a
+  # 4-core GitHub runner. GitHub kills a job at 6 h, so the per-push job
+  # could never finish — it ran for hours and was then cancelled by the
+  # next push, which reads as "still running" forever rather than as a
+  # result.
+  #
+  # The same three commits produce **32 mutants** when scoped to their own
+  # diff: about 8 minutes. That is the feedback that matters on a push —
+  # does the suite discriminate the code you just wrote — and it is fast
+  # enough that someone waits for it.
+  #
+  # The whole crate still runs, nightly, via `mutants-full`. Mutation
+  # testing is THE bar for this project (AGENTS.md) and scoping it per
+  # push would quietly lower that bar; scoping it per push *and* keeping a
+  # full run does not.
+  scope=()
+  if [ -n "${RACHNA_MUTANTS_DIFF:-}" ]; then
+    echo "  scope    = the changes in $RACHNA_MUTANTS_DIFF"
+    scope=(--in-diff "$RACHNA_MUTANTS_DIFF")
+  elif [ -n "${RACHNA_MUTANTS_SHARD:-}" ]; then
+    # The nightly sweep's slice. Passed THROUGH the gate rather than
+    # around it: `cargo mutants --shard` called directly from a workflow
+    # would skip the isolated `$HOME` below, and that is what stops a
+    # mutated `start` leaving VMs and project directories in the real
+    # `~/.rachna` — 18 orphaned processes and 19 GB on the machine where
+    # it was measured.
+    echo "  scope    = shard $RACHNA_MUTANTS_SHARD of the whole crate"
+    scope=(--shard "$RACHNA_MUTANTS_SHARD")
+  else
+    echo "  scope    = the whole crate (hours; see mutants-full in CI)"
+  fi
+  echo
+
   status=0
-  HOME="$mutants_home" cargo mutants --colors=never || status=$?
+  HOME="$mutants_home" cargo mutants --colors=never "${scope[@]}" || status=$?
   # Any supervisor a mutant managed to spawn points at this HOME, so the
   # pattern cannot match a real one the developer is using.
   pkill -f "$mutants_home" 2>/dev/null || true

@@ -83,11 +83,42 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history, because `--in-diff` needs something to compare
+          # against and a shallow clone has no merge base.
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@nextest
       - uses: taiki-e/install-action@cargo-mutants
       - uses: Swatinem/rust-cache@v2
+
+      # THE DIFF, not the crate. Measured at 0.26 min/mutant, so the
+      # crate's 1204 mutants are ~13 h on a 4-core runner and GitHub kills
+      # a job at 6 h — the full run could never pass here, it could only
+      # be cancelled by the next push. Three commits' worth of change is
+      # 32 mutants, about 8 minutes.
+      #
+      # `fetch-depth: 0` is needed above for this to have anything to
+      # compare against; a shallow clone has no merge base.
+      - name: the diff this push introduced
+        run: |
+          # On a PR, everything since the merge base. On a push to main,
+          # the pushed range — `github.event.before` is the previous tip,
+          # and is all-zeroes for the first push to a new branch, in which
+          # case fall back to the last commit.
+          if [ -n "${{ github.event.pull_request.base.sha }}" ]; then
+            base='${{ github.event.pull_request.base.sha }}'
+          elif [ '${{ github.event.before }}' != '0000000000000000000000000000000000000000' ]; then
+            base='${{ github.event.before }}'
+          else
+            base="$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)"
+          fi
+          echo "comparing against $base"
+          git diff "$base" HEAD > /tmp/push.diff
+          wc -l < /tmp/push.diff
       - run: ci/gate.sh mutants
+        env:
+          RACHNA_MUTANTS_DIFF: /tmp/push.diff
       - name: upload mutants report
         if: always()
         uses: actions/upload-artifact@v4

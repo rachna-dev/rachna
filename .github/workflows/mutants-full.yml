@@ -1,0 +1,88 @@
+# The WHOLE crate under mutation testing, nightly.
+#
+# WHY THIS IS SEPARATE FROM `ci`. Mutation testing is THE bar for this
+# project (AGENTS.md: "a surviving mutant in policy or path code is a bug in
+# the test suite"), and the per-push job in `ci.yml` is scoped to the diff so
+# it finishes in minutes. Scoping per push *alone* would quietly lower the
+# bar — a mutant in code nobody touched would never be tested again. This job
+# is what keeps that from happening.
+#
+# Measured, which is why it cannot live in `ci`: 0.26 min/mutant, so the
+# crate's ~1200 mutants are ~5.3 h on a 10-core machine and ~13 h on a
+# 4-core GitHub runner. The default job timeout is 6 h, so the full run in
+# the push gate could never pass — it ran for hours and was then cancelled
+# by the next push, which reads as "still running" rather than as a failure.
+#
+# So it runs on a schedule where hours cost nobody anything, with the timeout
+# raised and sharding to bring it back under one night.
+name: mutants-full
+
+on:
+  schedule:
+    # 02:00 UTC. Late enough that a day's pushes are in, early enough that
+    # the result is waiting in the morning.
+    - cron: '0 2 * * *'
+  # On demand, because a nightly-only signal is a bad thing to have to wait
+  # for when you are deliberately changing the test suite.
+  workflow_dispatch:
+
+concurrency:
+  # NOT `cancel-in-progress`. The push gate cancels superseded runs because
+  # a stale fast check is noise; a half-finished mutation run is the only
+  # whole-crate signal there is, and throwing it away to start again from
+  # zero means never finishing one.
+  group: mutants-full
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  mutants:
+    name: full mutation sweep (shard ${{ matrix.shard }}/6)
+    runs-on: ubuntu-latest
+    # ~13 h split six ways is ~2.2 h, so 4 h is generous headroom without
+    # being the 6 h default that the unsharded job used to die against.
+    timeout-minutes: 240
+    strategy:
+      # fail-fast OFF: a surviving mutant in one shard says nothing about
+      # the others, and cancelling them would hide every other survivor
+      # behind whichever shard happened to report first.
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@cargo-mutants
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Per-shard, because each builds a different set of mutated trees
+          # and one shared key would have them overwriting each other.
+          key: mutants-shard-${{ matrix.shard }}
+
+      - name: reclaim disk
+        run: |
+          # `cargo mutants` copies the source tree per parallel job, and a
+          # runner starts fairly full.
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
+          df -h / | tail -1
+
+      # THROUGH `ci/gate.sh`, not around it. A first draft called
+      # `cargo mutants --shard` directly, reasoning that sharding is a CI
+      # concern rather than a gate concern — which would have skipped the
+      # gate's isolated `$HOME`, and that is the thing that stops a
+      # mutated `start` leaving VMs in the real `~/.rachna`. Measured once
+      # already: 18 orphaned supervisors and 19 GB.
+      - run: ci/gate.sh mutants
+        env:
+          RACHNA_MUTANTS_SHARD: ${{ matrix.shard }}/6
+
+      - name: upload this shard's report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutants-shard-${{ matrix.shard }}
+          path: mutants.out/
+          if-no-files-found: ignore
