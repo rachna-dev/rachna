@@ -639,6 +639,83 @@ mod commands {
             root,
             state,
         );
+        // THE EXCLUSION CHECK, before anything is mounted.
+        //
+        // `00` §3.11: the guest never sees `rachna.nix`, because a guest
+        // that can write its own policy can grant itself permissions —
+        // concretely an `npm` postinstall appending an `allow` rule
+        // (`15` §104). And `08` §4 calls the shim directory WORSE than the
+        // policy file: a guest that replaces `.rachna/bin/rustfmt` gets
+        // code execution on the HOST, because the editor is configured to
+        // run it.
+        //
+        // `exclusion.rs` had the whole mechanism — inode comparison, the
+        // `nlink > 1` pre-filter, a vacuity guard — and nothing called it.
+        // Measured on a real guest before this landed, from its own
+        // console:
+        //
+        //   RACHNA-WORKSPACE-FILES: AGENTS.md Cargo.lock … rachna.nix src
+        //
+        // REFUSES rather than warns. `00` §3.7's rule is that a missing
+        // enforcement is stated, not worked around, and a share this check
+        // could not verify is one it cannot vouch for.
+        // THE SHIM DIRECTORY IS CREATED FIRST, because it must exist to
+        // have an inode and an inode is what the check compares.
+        //
+        // Measured: without this, every `start` refused with
+        //
+        //   rachna: cannot stat …/excl-f7c2d857/bin to exclude it from the
+        //   guest's view. Starting would mount a share this check never
+        //   verified
+        //
+        // which is `resolve_with` behaving exactly as documented — it
+        // treats an unresolvable exclusion as a refusal, because `14` §3's
+        // protection is per-inode and a missing inode is an unprotected
+        // file. `exclusion.rs` anticipated this and said the CALLER must
+        // distinguish the cases: "a path that does not exist is not an
+        // error for the shim directory, which Rachna creates on first
+        // start". Creating it is the honest way to distinguish them — the
+        // alternative, skipping an exclusion that cannot be resolved, is
+        // the silent half-protection that function refuses to do.
+        if let Err(error) = std::fs::create_dir_all(paths.shim_dir()) {
+            eprintln!(
+                "rachna: cannot create {}: {error}",
+                paths.shim_dir().display()
+            );
+            return ExitCode::from(FAILED);
+        }
+        let exclusions = paths.exclusions(&context.project_dir);
+        for share in &plan.shares {
+            match rachna::exclusion::verify(&exclusions, &share.host_path) {
+                Ok(verdict) => {
+                    // ADVISORIES FIRST, and printed whether or not the
+                    // start continues: `idea.md` §16.2 forbids a silent
+                    // downgrade, and "the guest can read your policy file"
+                    // is exactly the fact a user should know even though
+                    // it is not fatal.
+                    for advisory in verdict.advisories() {
+                        eprintln!("rachna: note — {advisory}");
+                    }
+                    let fatal = verdict.fatal_refusals();
+                    if !fatal.is_empty() {
+                        eprintln!(
+                            "rachna: refusing to share {} — the guest would \
+                             reach something no gate can make safe:",
+                            share.host_path.display()
+                        );
+                        for refusal in fatal {
+                            eprintln!("  {refusal}");
+                        }
+                        return ExitCode::from(REFUSED);
+                    }
+                }
+                Err(error) => {
+                    eprintln!("rachna: {error}");
+                    return ExitCode::from(REFUSED);
+                }
+            }
+        }
+
         // Logged because a share that silently fails to attach is invisible
         // otherwise: the guest just reports no workspace, which looks
         // guest-side and is not.

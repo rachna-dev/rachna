@@ -83,6 +83,8 @@ impl fmt::Display for FileId {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExclusionSet {
     paths: Vec<PathBuf>,
+    /// The subset whose exposure is fatal rather than advisory.
+    fatal: Vec<PathBuf>,
 }
 
 impl ExclusionSet {
@@ -96,7 +98,41 @@ impl ExclusionSet {
     pub fn for_project(policy_file: &Path, shim_dir: &Path) -> Self {
         Self {
             paths: vec![policy_file.to_path_buf(), shim_dir.to_path_buf()],
+            fatal: vec![shim_dir.to_path_buf()],
         }
+    }
+
+    /// The paths whose exposure must REFUSE a start rather than warn.
+    ///
+    /// # Why this is a split and not one rule
+    ///
+    /// The two entries differ in severity, and this type's own header says
+    /// so: the shim directory is *"worse than the policy-tampering attack
+    /// it mirrors"* because a guest replacing `.rachna/bin/rustfmt` gets
+    /// **code execution on the host**, and *"no reload gate helps here"*.
+    /// `rachna.nix` is *"a default rather than a requirement"*, since
+    /// `00` §3.11a gated the reload and a guest-written grant is inert
+    /// until approved.
+    ///
+    /// Treating them alike was measured as unusable. A first version
+    /// refused any share the policy file was reachable from — which is
+    /// EVERY project, because `rachna.nix` lives in the project directory
+    /// and that directory is the workspace share:
+    ///
+    /// ```text
+    /// rachna: refusing to share …/excl — the guest would be able to reach
+    ///   something it must not:
+    ///   …/excl/rachna.nix is the same file as an excluded one
+    /// ```
+    ///
+    /// And it cannot be fixed by hiding the file: `14` §2 measured VZ's
+    /// entire share API as *"a URL and a read-only flag … no exclusion
+    /// list"*, so a virtiofs share is all-or-nothing. Refusing a condition
+    /// that is unavoidable by design is not a security control, it is a
+    /// tool that does not start.
+    #[must_use]
+    pub fn fatal(&self) -> &[PathBuf] {
+        &self.fatal
     }
 
     /// The paths to resolve.
@@ -198,6 +234,14 @@ pub enum Refusal {
         entry_device: u64,
         share_device: u64,
     },
+    /// A directory inside the share could not be read.
+    ///
+    /// A REFUSAL rather than a footnote, because `14` §3's inode check is
+    /// only as good as its coverage: a tree holding a directory nobody
+    /// could read is a tree where an excluded inode might be hiding, and
+    /// `Verdict::is_vacuous`'s whole argument is that a check against
+    /// nothing refuses nothing.
+    Unreadable { entry: PathBuf },
 }
 
 impl fmt::Display for Refusal {
@@ -207,6 +251,13 @@ impl fmt::Display for Refusal {
                 f,
                 "{} is the same file as an excluded one ({id}), so mounting \
                  this share would expose it",
+                entry.display()
+            ),
+            Self::Unreadable { entry } => write!(
+                f,
+                "{} could not be read, so this check cannot vouch for what \
+                 is inside it. Fix its permissions or exclude it from the \
+                 workspace",
                 entry.display()
             ),
             Self::CrossesFilesystem {
@@ -236,13 +287,83 @@ pub struct Verdict {
     refusals: Vec<Refusal>,
     entries_examined: usize,
     excluded_resolved: usize,
+    /// Identities whose exposure is fatal. Empty for a pure `check`, which
+    /// has no filesystem and therefore no severity information.
+    fatal: BTreeSet<FileId>,
 }
 
 impl Verdict {
+    /// Records a directory the walk could not read.
+    ///
+    /// Takes the path rather than a `Refusal` so the caller cannot choose a
+    /// *different* refusal for it: an unreadable directory has exactly one
+    /// meaning here.
+    pub fn push_unreadable(&mut self, entry: PathBuf) {
+        self.refusals.push(Refusal::Unreadable { entry });
+    }
+
+    /// Records an entry whose identity is in the excluded set.
+    ///
+    /// For the containment case `check`'s `nlink > 1` filter deliberately
+    /// skips: a file with ONE name, sitting inside the share, which is
+    /// simply the policy file being where it must not be.
+    pub fn push_reaches(&mut self, entry: PathBuf, id: FileId) {
+        self.refusals
+            .push(Refusal::ReachesExcludedFile { entry, id });
+    }
+
     /// Whether the share may be mounted.
     #[must_use]
     pub const fn is_allowed(&self) -> bool {
         self.refusals.is_empty()
+    }
+
+    /// The refusals that must STOP a start.
+    ///
+    /// Exposure of the shim directory, and any entry this check could not
+    /// see. Both are unmitigated: the first is host code execution
+    /// (`08` §4), and the second means the check has a blind spot, which
+    /// `Verdict::is_vacuous` argues is not a pass.
+    #[must_use]
+    pub fn fatal_refusals(&self) -> Vec<&Refusal> {
+        self.refusals
+            .iter()
+            .filter(|refusal| match refusal {
+                Refusal::ReachesExcludedFile { id, .. } => self.fatal.contains(id),
+                // A directory nobody could read, or an entry on another
+                // filesystem, is a gap in coverage rather than a known
+                // exposure — and a check with a gap cannot vouch for what
+                // it did not see.
+                Refusal::Unreadable { .. } | Refusal::CrossesFilesystem { .. } => true,
+            })
+            .collect()
+    }
+
+    /// The refusals worth SAYING but not worth stopping for.
+    ///
+    /// Today this is the policy file being visible, which `14` §2 measured
+    /// as unavoidable — VZ's share API is *"a URL and a read-only flag …
+    /// no exclusion list"* — and which `00` §3.11a's reload gate already
+    /// renders inert: a grant the guest writes is not applied until the
+    /// user approves it.
+    #[must_use]
+    pub fn advisories(&self) -> Vec<&Refusal> {
+        self.refusals
+            .iter()
+            .filter(|refusal| match refusal {
+                Refusal::ReachesExcludedFile { id, .. } => !self.fatal.contains(id),
+                Refusal::Unreadable { .. } | Refusal::CrossesFilesystem { .. } => false,
+            })
+            .collect()
+    }
+
+    /// Whether the share may be mounted **given** the severity split.
+    ///
+    /// The question `start` actually asks. `is_allowed` is the strict form
+    /// and stays, because the pure `check` tests assert it.
+    #[must_use]
+    pub fn may_mount(&self) -> bool {
+        self.fatal_refusals().is_empty()
     }
 
     /// Every reason the share was refused.
@@ -327,6 +448,11 @@ pub fn check(
 
     Verdict {
         refusals,
+        // EMPTY for a pure check: severity comes from the filesystem, and
+        // `check` has none. `verify` fills it in, so a pure verdict treats
+        // every refusal as advisory rather than claiming a severity it
+        // cannot know.
+        fatal: BTreeSet::new(),
         entries_examined: entries.len(),
         excluded_resolved: excluded.len(),
     }
@@ -353,8 +479,620 @@ pub fn is_excluded_by_name(path: &Path, excluded_names: &[&str]) -> bool {
     })
 }
 
+/// Stats one path, or `None` if it cannot be seen.
+///
+/// The `stat` [`ExclusionSet::resolve_with`] wants, over the real
+/// filesystem. Separate so the pure half stays testable without one.
+///
+/// FOLLOWS SYMLINKS, deliberately: `metadata` rather than
+/// `symlink_metadata`. The question is which FILE a name reaches, and a
+/// symlink's own inode is not the file an attacker is trying to read —
+/// `~/.gitconfig` on a home-manager machine is a link into the Nix store,
+/// and the store file is what matters.
+#[must_use]
+pub fn stat(path: &Path) -> Option<FileId> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some(id_of(&metadata))
+}
+
+/// A [`FileId`] from metadata already obtained.
+#[cfg(unix)]
+fn id_of(metadata: &std::fs::Metadata) -> FileId {
+    use std::os::unix::fs::MetadataExt;
+    FileId {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    }
+}
+
+#[cfg(not(unix))]
+fn id_of(_metadata: &std::fs::Metadata) -> FileId {
+    // Windows is `01` §3's unmeasured backend. Returning a constant would
+    // make every entry look like every other, which `check` would read as
+    // a universal collision — so the walk refuses on this platform instead
+    // and `verify` reports it.
+    FileId {
+        device: 0,
+        inode: 0,
+    }
+}
+
+/// How deep the walk goes before giving up.
+///
+/// A project tree is wide rather than deep, and a symlink loop inside the
+/// share would otherwise spin forever. 64 is far past any real source tree
+/// and bounded enough that a hostile layout cannot hang `rachna start`.
+const MAX_DEPTH: usize = 64;
+
+/// Walks a share and returns every entry, with the facts [`check`] needs.
+///
+/// # Why every entry, and not just the links
+///
+/// `check` applies the `nlink > 1` filter itself (`14` §3), and the comment
+/// there gives the reason: the caller hands over everything it saw, so the
+/// walk cannot accidentally filter *more* than the security decision
+/// intends. This function therefore does no filtering at all.
+///
+/// # Errors
+///
+/// [`WalkError`] when the share's own root cannot be read. A subdirectory
+/// that cannot be read is **not** an error — it is reported as unreadable
+/// and the mount is refused, because a directory this check could not see
+/// is one it cannot vouch for.
+pub fn walk(share_root: &Path) -> Result<Walked, WalkError> {
+    let root_metadata = std::fs::metadata(share_root).map_err(|error| WalkError {
+        path: share_root.to_path_buf(),
+        why: error.to_string(),
+    })?;
+    if !root_metadata.is_dir() {
+        return Err(WalkError {
+            path: share_root.to_path_buf(),
+            why: "not a directory".to_owned(),
+        });
+    }
+
+    let mut walked = Walked {
+        root_device: id_of(&root_metadata).device,
+        entries: Vec::new(),
+        unreadable: Vec::new(),
+    };
+    let mut queue = vec![(share_root.to_path_buf(), 0usize)];
+
+    while let Some((dir, depth)) = queue.pop() {
+        if depth > MAX_DEPTH {
+            walked.unreadable.push(dir);
+            continue;
+        }
+        let Ok(reader) = std::fs::read_dir(&dir) else {
+            // Recorded, not skipped. A directory the check could not read
+            // is one it cannot vouch for, and `Verdict::is_vacuous`'s whole
+            // argument is that a check against nothing refuses nothing.
+            walked.unreadable.push(dir);
+            continue;
+        };
+        for entry in reader {
+            let Ok(entry) = entry else { continue };
+            let path = entry.path();
+            // `symlink_metadata` HERE, unlike `stat` above, and the
+            // difference is the point: for the exclusion SET we ask what a
+            // name reaches, but while walking we must not follow a link out
+            // of the share — a symlink to `/` would otherwise make this walk
+            // the host filesystem.
+            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                walked.unreadable.push(path);
+                continue;
+            };
+            if metadata.is_dir() {
+                queue.push((path, depth + 1));
+                continue;
+            }
+            // A SYMLINK IS RESOLVED FOR ITS IDENTITY, because that is the
+            // attack: a link named `innocuous.txt` pointing at the policy
+            // file reaches it, and its own inode would not match. `13` §4
+            // measured the hardlink variant; a symlink is the same shape
+            // with a cheaper setup.
+            let id = if metadata.file_type().is_symlink() {
+                match stat(&path) {
+                    Some(id) => id,
+                    // A dangling link reaches nothing, so it cannot reach
+                    // an excluded file either.
+                    None => continue,
+                }
+            } else {
+                id_of(&metadata)
+            };
+            walked.entries.push(ShareEntry {
+                path,
+                id,
+                links: links_of(&metadata),
+            });
+        }
+    }
+    Ok(walked)
+}
+
+#[cfg(unix)]
+fn links_of(metadata: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    metadata.nlink()
+}
+
+#[cfg(not(unix))]
+fn links_of(_metadata: &std::fs::Metadata) -> u64 {
+    // Unknown, so reported as >1 to make `check` compare it rather than
+    // skip it. Over-checking is the safe direction.
+    2
+}
+
+/// What a walk found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Walked {
+    /// `st_dev` of the share root, for the cross-filesystem check.
+    pub root_device: u64,
+    /// Every file found, unfiltered.
+    pub entries: Vec<ShareEntry>,
+    /// Paths that could not be read, so could not be vouched for.
+    pub unreadable: Vec<PathBuf>,
+}
+
+/// A share that could not be walked at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalkError {
+    /// The share root.
+    pub path: PathBuf,
+    /// Why.
+    pub why: String,
+}
+
+impl fmt::Display for WalkError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "cannot read {} to check what the guest would see: {}. \
+             Starting would mount a share this check never verified",
+            self.path.display(),
+            self.why
+        )
+    }
+}
+
+impl core::error::Error for WalkError {}
+
+/// The whole check, over the real filesystem.
+///
+/// **This is the function that was missing.** `check` existed and was
+/// tested; `ExclusionSet` existed and was tested; nothing walked a share or
+/// stat'd a path, so `00` §3.11's invariant — `rachna.nix` is invisible to
+/// the guest — was documented and unenforced. Measured before this landed:
+/// a real guest's own console printed
+///
+/// ```text
+/// RACHNA-WORKSPACE-FILES: AGENTS.md Cargo.lock … rachna.nix src target
+/// ```
+///
+/// # Errors
+///
+/// [`VerifyError::Resolve`] when an excluded path cannot be stat'd, and
+/// [`VerifyError::Walk`] when the share cannot be read. Both REFUSE rather
+/// than warn: a check that could not look is not a check that passed.
+pub fn verify(set: &ExclusionSet, share_root: &Path) -> Result<Verdict, VerifyError> {
+    let excluded = set.resolve_with(stat).map_err(VerifyError::Resolve)?;
+    // The FATAL subset, resolved separately, so a refusal can say whether
+    // it stops the start or merely warrants a warning. Resolved with the
+    // same `stat` so a path appearing in both sets compares equal.
+    let fatal: BTreeSet<FileId> = set.fatal().iter().filter_map(|p| stat(p)).collect();
+    let walked = walk(share_root).map_err(VerifyError::Walk)?;
+
+    // TWO CHECKS, because they catch different things and `check` alone
+    // catches only one.
+    //
+    // `check` applies `14` §3's `nlink > 1` pre-filter, which is sound for
+    // the attack it was designed against — a HARDLINK giving an excluded
+    // file a second name — because a hardlink necessarily has `nlink >= 2`.
+    //
+    // It does NOT catch the plainest case: the policy file simply being
+    // inside the share, with `nlink == 1`. Measured — the first version of
+    // this function called `check` alone and allowed a share containing
+    // `rachna.nix`, which is the exact invariant `00` §3.11 states and the
+    // exact thing a real guest's console had already printed:
+    //
+    //   RACHNA-WORKSPACE-FILES: AGENTS.md Cargo.lock … rachna.nix src
+    //
+    // So containment is checked directly, without the link filter: any
+    // entry whose identity is in the excluded set is refused however many
+    // names it has.
+    let mut verdict = check(walked.root_device, &excluded, &walked.entries);
+    for entry in &walked.entries {
+        if entry.links <= 1 && excluded.contains(&entry.id) {
+            verdict.push_reaches(entry.path.clone(), entry.id);
+        }
+    }
+    // An unreadable directory becomes a REFUSAL, not a footnote. `14` §3's
+    // check is only as good as its coverage, and a tree with a directory
+    // nobody could read is a tree where an excluded inode might be hiding.
+    for path in walked.unreadable {
+        verdict.push_unreadable(path);
+    }
+    verdict.fatal = fatal;
+    Ok(verdict)
+}
+
+/// Why the check could not reach a verdict.
+#[derive(Debug)]
+pub enum VerifyError {
+    /// An excluded path could not be stat'd.
+    Resolve(ResolveError),
+    /// The share could not be walked.
+    Walk(WalkError),
+}
+
+impl fmt::Display for VerifyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Resolve(error) => write!(f, "{error}"),
+            Self::Walk(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl core::error::Error for VerifyError {}
+
 #[cfg(test)]
 mod tests {
+    // ---- the real filesystem: what was missing entirely ----------------
+
+    /// An exclusion set for a project, used by the filesystem tests.
+    fn set_for(policy: &Path, shims: &Path) -> ExclusionSet {
+        ExclusionSet::for_project(policy, shims)
+    }
+
+    /// A verdict's refusals as text, for assertions.
+    ///
+    /// `Verdict` has no `Display` — it exposes `refusals()` — so this
+    /// renders them rather than a Display impl being added just for tests.
+    fn why(verdict: &Verdict) -> String {
+        verdict
+            .refusals()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    /// A scratch directory, removed by each test that makes one.
+    fn scratch(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("rachna-exclusion-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        dir
+    }
+
+    /// A project share with a `rachna.nix` and a shim directory in it.
+    fn project(dir: &Path) -> (PathBuf, PathBuf) {
+        let policy = dir.join("rachna.nix");
+        std::fs::write(&policy, "{ tier = \"none\"; }\n").expect("policy");
+        let shims = dir.join(".rachna/bin");
+        std::fs::create_dir_all(&shims).expect("shims");
+        (policy, shims)
+    }
+
+    #[test]
+    fn the_policy_file_inside_the_share_is_refused() {
+        // THE INVARIANT, finally enforced. `00` §3.11: the guest never sees
+        // `rachna.nix`, because a guest that can write its own policy can
+        // grant itself permissions — concretely, an `npm` postinstall
+        // appending an `allow` rule (`15` §104).
+        //
+        // Measured BEFORE this landed, from a real guest's own console:
+        //
+        //   RACHNA-WORKSPACE-FILES: AGENTS.md Cargo.lock … rachna.nix src
+        //
+        // `check` and `ExclusionSet` both existed and were tested. Nothing
+        // walked a share or stat'd a path, so the invariant was documented
+        // and unenforced — which `exclusion.rs`'s own header calls the
+        // "declared and never enforced" shape, apparently without noticing
+        // it described this module.
+        let dir = scratch("policy-visible");
+        let (policy, shims) = project(&dir);
+        let set = ExclusionSet::for_project(&policy, &shims);
+
+        let verdict = verify(&set, &dir).expect("the share is readable");
+        // DETECTED, and reported as an ADVISORY rather than fatal.
+        //
+        // The first version of this test asserted the start was refused,
+        // and that behaviour was measured as unusable: `rachna.nix` lives
+        // in the project directory and the project directory IS the
+        // workspace share, so it refused every project that exists. And
+        // `14` §2 measured VZ's share API as "a URL and a read-only flag …
+        // no exclusion list", so the file cannot be hidden — refusing a
+        // condition that is unavoidable by design is not a control.
+        //
+        // `00` §3.11a's reload gate is what makes advisory the right level:
+        // a grant the guest writes is inert until the user approves it.
+        assert!(!verdict.is_allowed(), "it must still be DETECTED");
+        assert!(verdict.may_mount(), "but it must not stop a start");
+        assert_eq!(verdict.advisories().len(), 1, "{}", why(&verdict));
+        assert!(verdict.fatal_refusals().is_empty(), "{}", why(&verdict));
+        assert!(
+            !verdict.is_vacuous(),
+            "the check must have compared something"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reaching_the_shim_directory_is_fatal() {
+        // THE ENTRY THAT MATTERS. `08` §4's table calls this "worse than
+        // the policy-tampering attack it mirrors": a guest that replaces
+        // `.rachna/bin/rustfmt` gets code execution on the HOST, because
+        // the editor is configured to run it. No reload gate helps —
+        // there is no reload to gate — so this one stops a start.
+        let dir = scratch("shim-fatal");
+        let share = dir.join("workspace");
+        std::fs::create_dir_all(&share).expect("share");
+        let policy = dir.join("rachna.nix");
+        std::fs::write(&policy, "{ }\n").expect("policy");
+        let shims = dir.join(".rachna/bin");
+        std::fs::create_dir_all(&shims).expect("shims");
+
+        // The attack: a name inside the share reaching the shim directory.
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&shims, share.join("tools")).expect("symlink");
+
+        let verdict = verify(&set_for(&policy, &shims), &share).expect("readable");
+        assert!(
+            !verdict.may_mount(),
+            "shim exposure must stop a start: {}",
+            why(&verdict)
+        );
+        assert_eq!(verdict.fatal_refusals().len(), 1, "{}", why(&verdict));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_clean_share_has_neither_advisories_nor_refusals() {
+        // The control. Without this, the two tests above could both be
+        // satisfied by a check that flags everything.
+        let dir = scratch("clean-split");
+        let share = dir.join("workspace");
+        std::fs::create_dir_all(&share).expect("share");
+        std::fs::write(share.join("main.rs"), "fn main() {}\n").expect("src");
+        let policy = dir.join("rachna.nix");
+        std::fs::write(&policy, "{ }\n").expect("policy");
+        let shims = dir.join(".rachna/bin");
+        std::fs::create_dir_all(&shims).expect("shims");
+
+        let verdict = verify(&set_for(&policy, &shims), &share).expect("readable");
+        assert!(verdict.may_mount());
+        assert!(verdict.advisories().is_empty(), "{}", why(&verdict));
+        assert!(verdict.fatal_refusals().is_empty(), "{}", why(&verdict));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_share_without_the_policy_file_is_allowed() {
+        // The other half, and the one that proves the test above is not
+        // simply refusing everything. `rachna.nix` lives beside the
+        // project rather than inside the shared directory.
+        let dir = scratch("policy-outside");
+        let share = dir.join("workspace");
+        std::fs::create_dir_all(&share).expect("share");
+        std::fs::write(share.join("main.rs"), "fn main() {}\n").expect("source");
+        let policy = dir.join("rachna.nix");
+        std::fs::write(&policy, "{ tier = \"none\"; }\n").expect("policy");
+        let shims = dir.join(".rachna/bin");
+        std::fs::create_dir_all(&shims).expect("shims");
+        let set = ExclusionSet::for_project(&policy, &shims);
+
+        let verdict = verify(&set, &share).expect("readable");
+        assert!(
+            verdict.is_allowed(),
+            "a clean share must mount: {}",
+            why(&verdict)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_real_hardlink_on_disk_to_the_policy_file_is_refused() {
+        // `13` §4's MEASURED attack: a second name for the same inode.
+        // `14` §4's table calls this the one the case-sensitive volume does
+        // NOT close, so the inode check is the only thing that catches it.
+        let dir = scratch("hardlink");
+        let share = dir.join("workspace");
+        std::fs::create_dir_all(&share).expect("share");
+        let policy = dir.join("rachna.nix");
+        std::fs::write(&policy, "{ tier = \"none\"; }\n").expect("policy");
+        let shims = dir.join(".rachna/bin");
+        std::fs::create_dir_all(&shims).expect("shims");
+
+        // The attack: an innocuous name inside the share, same inode.
+        let decoy = share.join("innocuous.txt");
+        if std::fs::hard_link(&policy, &decoy).is_err() {
+            println!("SKIP: this filesystem refused a hardlink");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+
+        let set = ExclusionSet::for_project(&policy, &shims);
+        let verdict = verify(&set, &share).expect("readable");
+        assert!(
+            !verdict.is_allowed(),
+            "a hardlink reaching the policy file must be refused: {}",
+            why(&verdict)
+        );
+        // NAMES THE DECOY, because the attacker chose that name and it is
+        // therefore evidence (`14` §3).
+        assert!(
+            why(&verdict).contains("innocuous.txt"),
+            "the refusal must name what reached it: {}",
+            why(&verdict)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_symlink_to_the_policy_file_is_refused() {
+        // The same shape as a hardlink with a cheaper setup, and the walk
+        // has to RESOLVE a link to catch it: a symlink's own inode is not
+        // the file it reaches, so comparing the link itself would pass.
+        let dir = scratch("symlink");
+        let share = dir.join("workspace");
+        std::fs::create_dir_all(&share).expect("share");
+        let policy = dir.join("rachna.nix");
+        std::fs::write(&policy, "{ tier = \"none\"; }\n").expect("policy");
+        let shims = dir.join(".rachna/bin");
+        std::fs::create_dir_all(&shims).expect("shims");
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&policy, share.join("notes.md")).expect("symlink");
+
+        let set = ExclusionSet::for_project(&policy, &shims);
+        let verdict = verify(&set, &share).expect("readable");
+        assert!(
+            !verdict.is_allowed(),
+            "a symlink reaching the policy file must be refused: {}",
+            why(&verdict)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_dangling_symlink_is_not_a_refusal() {
+        // It reaches nothing, so it cannot reach an excluded file. Worth a
+        // test because the obvious implementation — treat an unstattable
+        // entry as suspicious — would refuse every broken link in a real
+        // project, and broken links are ordinary.
+        let dir = scratch("dangling");
+        let share = dir.join("workspace");
+        std::fs::create_dir_all(&share).expect("share");
+        let policy = dir.join("rachna.nix");
+        std::fs::write(&policy, "{ }\n").expect("policy");
+        let shims = dir.join(".rachna/bin");
+        std::fs::create_dir_all(&shims).expect("shims");
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.join("nowhere"), share.join("broken")).expect("symlink");
+
+        let set = ExclusionSet::for_project(&policy, &shims);
+        let verdict = verify(&set, &share).expect("readable");
+        assert!(
+            verdict.is_allowed(),
+            "a broken link reaches nothing: {}",
+            why(&verdict)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_walk_does_not_follow_a_symlink_out_of_the_share() {
+        // A symlinked DIRECTORY pointing at `/` would otherwise make this
+        // walk the host filesystem — unbounded work on every `rachna
+        // start`, and the reason the walk uses `symlink_metadata` while the
+        // exclusion set uses `metadata`.
+        let dir = scratch("no-escape");
+        let share = dir.join("workspace");
+        std::fs::create_dir_all(share.join("src")).expect("share");
+        let policy = dir.join("rachna.nix");
+        std::fs::write(&policy, "{ }\n").expect("policy");
+        let shims = dir.join(".rachna/bin");
+        std::fs::create_dir_all(&shims).expect("shims");
+
+        // A link to the parent, which contains the policy file. Following
+        // it would both escape and find an excluded inode.
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&dir, share.join("escape")).expect("symlink");
+
+        let walked = walk(&share).expect("readable");
+        assert!(
+            !walked
+                .entries
+                .iter()
+                .any(|e| e.path.ends_with("escape/rachna.nix")),
+            "the walk followed a symlink out of the share: {:?}",
+            walked.entries
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unreadable_directory_refuses_rather_than_passing_quietly() {
+        // Coverage IS the check. A directory nobody could read is one where
+        // an excluded inode might be hiding, so it refuses — the same
+        // argument `Verdict::is_vacuous` makes about an empty comparison.
+        let dir = scratch("unreadable");
+        let share = dir.join("workspace");
+        let secret = share.join("locked");
+        std::fs::create_dir_all(&secret).expect("share");
+        let policy = dir.join("rachna.nix");
+        std::fs::write(&policy, "{ }\n").expect("policy");
+        let shims = dir.join(".rachna/bin");
+        std::fs::create_dir_all(&shims).expect("shims");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o000))
+                .expect("chmod");
+        }
+
+        let set = ExclusionSet::for_project(&policy, &shims);
+        let verdict = verify(&set, &share).expect("the root is readable");
+
+        #[cfg(unix)]
+        {
+            // Running as root defeats the permission, so the refusal is
+            // only asserted when the directory really was unreadable —
+            // otherwise this test would fail for a reason unrelated to the
+            // code.
+            if std::fs::read_dir(&secret).is_err() {
+                assert!(
+                    !verdict.is_allowed(),
+                    "an unreadable directory must refuse: {}",
+                    why(&verdict)
+                );
+                assert!(why(&verdict).contains("locked"), "{}", why(&verdict));
+            } else {
+                println!("SKIP: running with permission to read a 0o000 directory");
+            }
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o755));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unstattable_exclusion_refuses_rather_than_protecting_half() {
+        // `resolve_with`'s contract: a path that cannot be stat'd means the
+        // check never verified part of what it was asked to. Refusing is
+        // the only honest answer — `14` §3's protection is per-inode, so a
+        // missing inode is an unprotected file.
+        let dir = scratch("unresolvable");
+        let share = dir.join("workspace");
+        std::fs::create_dir_all(&share).expect("share");
+        let set = ExclusionSet::for_project(&dir.join("absent.nix"), &dir.join("gone"));
+
+        let error = verify(&set, &share).expect_err("an absent exclusion must refuse");
+        let text = error.to_string();
+        assert!(text.contains("absent.nix"), "name the path: {text}");
+        assert!(text.contains("refuses"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_share_that_is_not_a_directory_is_refused() {
+        // A file where a directory was expected is a config error, and
+        // mounting it would hand the guest something this check never
+        // walked.
+        let dir = scratch("not-a-dir");
+        let file = dir.join("afile");
+        std::fs::write(&file, "x").expect("file");
+        let error = walk(&file).expect_err("a file is not a share");
+        assert!(error.why.contains("not a directory"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     const SHARE_DEV: u64 = 1;
