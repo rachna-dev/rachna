@@ -53,7 +53,7 @@ prebuilt packages rather than the NixOS system it is designed around, and
 ## Install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/rachna-dev/racha/main/ci/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/rachna-dev/rachna/main/ci/install.sh | sh
 ```
 
 Fetches the binary and the Linux guest image for your machine, verifies both
@@ -84,7 +84,7 @@ by hand, run `xattr -d com.apple.quarantine rachna` first.
 Needs [Nix](https://nixos.org/download) with flakes, and macOS on Apple Silicon.
 
 ```sh
-git clone git@github.com:rachna-dev/racha.git && cd racha
+git clone git@github.com:rachna-dev/rachna.git && cd rachna
 devenv shell -- build          # compiles and signs it for Virtualization.framework
 bash ci/build-guest.sh         # the guest image, ~10 min, 615 MB
 ```

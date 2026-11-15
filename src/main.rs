@@ -1511,7 +1511,7 @@ mod commands {
             ],
             &["NIX_PATH"],
         ) {
-            Ok(output) if output.ok && !output.stdout.trim().is_empty() => {
+            Ok(output) if rachna::closure::usable_output(output.ok, &output.stdout) => {
                 PathBuf::from(output.stdout.trim())
             }
             Ok(output) => {

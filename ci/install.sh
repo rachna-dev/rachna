@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The one-line installer:
 #
-#   curl -fsSL https://raw.githubusercontent.com/rachna-dev/racha/main/ci/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/rachna-dev/rachna/main/ci/install.sh | sh
 #
 # Fetches the `rachna` binary and the guest image for this machine, verifies
 # both against published checksums, and puts the binary on PATH.
@@ -23,7 +23,7 @@
 # it — a defensive line is cheaper than a support thread.
 set -eu
 
-REPO="${RACHNA_REPO:-rachna-dev/racha}"
+REPO="${RACHNA_REPO:-rachna-dev/rachna}"
 VERSION="${RACHNA_VERSION:-latest}"
 PREFIX="${RACHNA_PREFIX:-$HOME/.local/bin}"
 GUEST_VERSION="26.11-3181085"

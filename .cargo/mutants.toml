@@ -126,6 +126,26 @@ exclude_re = [
   "replace commands::stop ->",
   "in commands::status\\b",
   "replace commands::status ->",
+  # `build` joins the list, and the pure half was EXTRACTED first.
+  #
+  # Mutation testing found seven survivors in `commands::build` after it
+  # landed. Four were one match guard —
+  # `output.ok && !output.stdout.trim().is_empty()` — replaced with
+  # `true`, with `false`, `&&` flipped to `||`, and the `!` deleted. That
+  # condition is pure, so it moved to `closure::usable_output` where a
+  # test kills all four, rather than being excluded in place.
+  #
+  # What remains is spawning `nix` three times and returning an
+  # `ExitCode`: the dry-run precheck, the build, and the pin resolution.
+  # A unit test cannot reach those conditions without a Nix installation,
+  # and `eval_sandbox` covers the one case that can be driven end to end
+  # (`build` on a bare spec, which took 153 s and lives out of the fast
+  # gate for that reason).
+  #
+  # Same debt as the six above, and the same real fix: move the remaining
+  # conditions into `closure.rs` where tests reach them.
+  "in commands::build\\b",
+  "replace commands::build ->",
   "in commands::spawn_supervisor\\b",
   "replace commands::spawn_supervisor ->",
   # `rachna-agent`'s entry point and its stdio adapter.

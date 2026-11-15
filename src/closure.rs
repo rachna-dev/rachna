@@ -254,6 +254,29 @@ impl BuildPlan {
     }
 }
 
+/// Whether a `nix` invocation produced a usable store path.
+///
+/// # Why this is a function rather than a match guard
+///
+/// It was `Ok(output) if output.ok && !output.stdout.trim().is_empty()`
+/// inline in `commands::build`, and mutation testing found FOUR survivors
+/// there — the guard replaced with `true`, with `false`, `&&` flipped to
+/// `||`, and the `!` deleted. None could be killed, because reaching that
+/// guard means spawning a real `nix`.
+///
+/// The condition is pure, so it belongs where a test can reach it. Both
+/// halves are load-bearing and for different reasons:
+///
+/// - **exit status**, because a failed `nix` says why on stderr and the
+///   caller must report that rather than proceed;
+/// - **non-empty stdout**, because `nix build --print-out-paths` can exit
+///   ZERO and print nothing. Treating that as success produces an empty
+///   store path, which then names the project directory itself.
+#[must_use]
+pub fn usable_output(ok: bool, stdout: &str) -> bool {
+    ok && !stdout.trim().is_empty()
+}
+
 /// What a dry run says would have to be compiled, excluding the wrapper.
 ///
 /// `nix build --dry-run` prints, on stderr:
@@ -482,6 +505,36 @@ mod tests {
     }
 
     // ---- reading the dry run -------------------------------------------
+
+    #[test]
+    fn a_usable_output_needs_both_success_and_a_path() {
+        // Four mutants survived when this was a match guard inside
+        // `commands::build`: the guard replaced with `true`, with `false`,
+        // `&&` flipped to `||`, and the `!` deleted. None was killable
+        // there, because reaching it means spawning a real `nix`.
+        assert!(usable_output(true, "/nix/store/abc-thing\n"));
+
+        // A FAILED nix is not usable even if it printed something: it says
+        // why on stderr and the caller must report that.
+        assert!(!usable_output(false, "/nix/store/abc-thing\n"));
+
+        // And success with no path is not usable either. This is the half
+        // that looks redundant and is not: `nix build --print-out-paths`
+        // can exit ZERO and print nothing, and treating that as success
+        // yields an empty store path — which then names the project
+        // directory itself.
+        assert!(!usable_output(true, ""));
+        assert!(!usable_output(true, "   \n  "));
+        assert!(!usable_output(false, ""));
+
+        // `&&` not `||`, stated as a property: exactly one of the four
+        // input combinations is usable.
+        let usable = [(true, "p"), (true, ""), (false, "p"), (false, "")]
+            .into_iter()
+            .filter(|(ok, out)| usable_output(*ok, out))
+            .count();
+        assert_eq!(usable, 1, "only success-with-a-path is usable");
+    }
 
     #[test]
     fn the_wrapper_alone_is_not_a_compile() {

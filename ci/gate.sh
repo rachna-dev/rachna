@@ -102,6 +102,30 @@ mutants() {
   #
   # A surviving mutant must still fail the gate, so the status is returned
   # after the cleanup rather than being replaced by `rm`'s.
+  # THE TOOLCHAIN MUST STILL BE FINDABLE from the isolated HOME.
+  #
+  # Measured: `HOME="$mutants_home" cargo mutants` broke CI for four
+  # consecutive runs with
+  #
+  #   error: rustup could not choose a version of cargo to run, because
+  #   one wasn't specified explicitly, and no default is configured
+  #
+  # reported under a job named "a surviving mutant fails the build", which
+  # is what made it look like a test failure for days. rustup resolves its
+  # toolchains through `$HOME/.rustup` and `$HOME/.cargo`, so moving HOME
+  # hides the compiler along with everything else.
+  #
+  # Linked rather than copied: a toolchain is ~1.5 GB and these are read
+  # at execution, so a symlink is both enough and instant. The point of
+  # the isolated HOME is `$HOME/.rachna` — where a mutated `start` would
+  # otherwise leave VMs and project directories — and nothing else needs
+  # to move.
+  for shared in .cargo .rustup; do
+    if [ -e "$HOME/$shared" ]; then
+      ln -s "$HOME/$shared" "$mutants_home/$shared"
+    fi
+  done
+
   status=0
   HOME="$mutants_home" cargo mutants --colors=never || status=$?
   # Any supervisor a mutant managed to spawn points at this HOME, so the
