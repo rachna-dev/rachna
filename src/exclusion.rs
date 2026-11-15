@@ -1081,6 +1081,123 @@ mod tests {
     }
 
     #[test]
+    fn a_tree_deeper_than_the_limit_is_reported_rather_than_walked_forever() {
+        // `MAX_DEPTH` bounds the walk so a hostile layout cannot hang
+        // `rachna start`. Three mutants survived here — `>` to `==`, `>` to
+        // `>=`, and `depth + 1` to `depth * 1` — because nothing built a
+        // tree deep enough to reach the limit.
+        //
+        // `depth * 1` is the interesting one: it makes depth permanently 0,
+        // so the bound never fires and a symlink loop or a pathological
+        // tree walks until something else gives out.
+        let dir = scratch("too-deep");
+        let share = dir.join("workspace");
+        let policy = dir.join("rachna.nix");
+        std::fs::write(&policy, "{ }\n").expect("policy");
+        let shims = dir.join(".rachna/bin");
+        std::fs::create_dir_all(&shims).expect("shims");
+
+        // THE BOUNDARY, not merely "something was refused".
+        //
+        // A first version built `0..=MAX_DEPTH` levels and asserted only
+        // that `unreadable` was non-empty. Both `> MAX_DEPTH` mutated to
+        // `==` and to `>=` SURVIVED it, because every variant refuses
+        // something in a tree that deep — the test could not tell which
+        // boundary was in force.
+        //
+        // So a file is planted on each side of the limit:
+        //
+        //   depth MAX_DEPTH      walked   (`>=` would refuse it)
+        //   depth MAX_DEPTH + 1  refused  (`==` would walk it)
+        //
+        // One file either side pins the comparison exactly.
+        let mut at_limit = share.clone();
+        for level in 0..MAX_DEPTH {
+            at_limit = at_limit.join(format!("d{level}"));
+        }
+        std::fs::create_dir_all(&at_limit).expect("tree to the limit");
+        std::fs::write(at_limit.join("at-limit.txt"), "x").expect("file");
+
+        let past_limit = at_limit.join("one-more");
+        std::fs::create_dir_all(&past_limit).expect("one past");
+        std::fs::write(past_limit.join("buried.txt"), "x").expect("buried");
+
+        let walked = walk(&share).expect("the root is readable");
+        assert!(
+            walked
+                .entries
+                .iter()
+                .any(|e| e.path.ends_with("at-limit.txt")),
+            "a directory AT the limit must still be walked — `>=` would have \
+             refused it: {:?}",
+            walked.unreadable
+        );
+        assert!(
+            !walked
+                .entries
+                .iter()
+                .any(|e| e.path.ends_with("buried.txt")),
+            "a directory PAST the limit must not be walked — `==` would have \
+             let it through"
+        );
+        assert!(
+            !walked.unreadable.is_empty(),
+            "the cut-off must be reported rather than silent"
+        );
+
+        // `verify` turns that into a REFUSAL, because a directory the check
+        // could not see is one it cannot vouch for.
+        let verdict = verify(&set_for(&policy, &shims), &share).expect("readable");
+        assert!(
+            !verdict.may_mount(),
+            "an unwalked subtree must refuse: {}",
+            why(&verdict)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_shallow_tree_is_walked_completely() {
+        // The control for the test above: without it, `> MAX_DEPTH` mutated
+        // to `>= 0` — refusing everything — would satisfy it.
+        let dir = scratch("shallow");
+        let share = dir.join("workspace");
+        std::fs::create_dir_all(share.join("src/inner")).expect("tree");
+        std::fs::write(share.join("src/inner/deep.rs"), "x").expect("file");
+        let policy = dir.join("rachna.nix");
+        std::fs::write(&policy, "{ }\n").expect("policy");
+        let shims = dir.join(".rachna/bin");
+        std::fs::create_dir_all(&shims).expect("shims");
+
+        let walked = walk(&share).expect("readable");
+        assert!(walked.unreadable.is_empty(), "{:?}", walked.unreadable);
+        assert!(
+            walked.entries.iter().any(|e| e.path.ends_with("deep.rs")),
+            "a nested file must still be examined: {:?}",
+            walked.entries
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_walk_failure_says_which_path_and_why() {
+        // `WalkError`'s `fmt` returning `Ok(())` survived: nothing asserted
+        // the text. It is what a user sees when a share cannot be read, and
+        // an empty message names neither the path nor the reason.
+        let dir = scratch("walk-error");
+        let missing = dir.join("nowhere");
+        let error = walk(&missing).expect_err("an absent share cannot be walked");
+        let text = error.to_string();
+        assert!(text.contains("nowhere"), "name the path: {text}");
+        assert!(
+            text.contains("check never verified"),
+            "say why it matters: {text}"
+        );
+        assert!(!text.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_share_that_is_not_a_directory_is_refused() {
         // A file where a directory was expected is a config error, and
         // mounting it would hand the guest something this check never

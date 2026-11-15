@@ -116,6 +116,22 @@ exclude_re = [
   "replace Image::in_dir ->",
   "replace > with >= in days_between",
   "replace binary_has_entitlement -> bool with true",
+  # `id_of` and `links_of`'s NON-UNIX arms, same class and same reason.
+  #
+  # `cargo-mutants` mutates source that `cfg` excludes from the host
+  # build, so the `cfg(not(unix))` arm of each is reported as surviving on
+  # a Mac — no unix test can reach code that is not compiled. The UNIX
+  # arms are exercised by every filesystem test in `exclusion.rs` (34 of
+  # them), which is why the pair is excluded by NAME rather than the file
+  # being skipped.
+  #
+  # Both are deliberately conservative on an unmeasured platform:
+  # `links_of` returns 2 so `check` COMPARES an entry rather than skipping
+  # it, and `id_of` returns a constant that makes `walk` refuse rather
+  # than guess. `01` §3 lists Windows as unmeasured, and these are the
+  # placeholders that keep it refusing rather than silently passing.
+  "replace id_of -> FileId",
+  "replace links_of -> u64",
   "in commands::start\\b",
   "replace commands::start ->",
   "in commands::suspend\\b",
